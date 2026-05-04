@@ -1,9 +1,8 @@
 import os
 import json
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -13,17 +12,22 @@ import google.generativeai as genai
 
 # --- Конфиг ---
 app = FastAPI()
+
+# База данных с проверкой на Render
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lifetrack.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# --- База данных ---
+# --- Модели БД ---
 class Habit(Base):
     __tablename__ = "habits"
     id = Column(Integer, primary_key=True)
     name = Column(String)
-    color = Column(String)
+    color = Column(String, default="#3B82F6")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class HabitLog(Base):
@@ -31,14 +35,14 @@ class HabitLog(Base):
     id = Column(Integer, primary_key=True)
     habit_id = Column(Integer)
     date = Column(DateTime)
-    completed = Column(Boolean)
+    completed = Column(Boolean, default=False)
 
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True)
     amount = Column(Float)
     category = Column(String)
-    type = Column(String)  # income / expense
+    type = Column(String)
     date = Column(DateTime, default=datetime.utcnow)
     note = Column(String, nullable=True)
 
@@ -49,14 +53,14 @@ class Book(Base):
     author = Column(String)
     total_pages = Column(Integer)
     current_page = Column(Integer, default=0)
-    status = Column(String)  # reading, completed, want_to_read
+    status = Column(String, default="reading")
 
 class DiaryEntry(Base):
     __tablename__ = "diary"
     id = Column(Integer, primary_key=True)
     content = Column(Text)
-    mood = Column(String)  # great, good, neutral, sad, bad
-    tags = Column(String)  # JSON array
+    mood = Column(String)
+    tags = Column(String, default="[]")
     date = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -88,47 +92,54 @@ class BookProgress(BaseModel):
 class DiaryCreate(BaseModel):
     content: str
     mood: str
-    tags: List[str]
+    tags: List[str] = []
 
 class ChatRequest(BaseModel):
     message: str
 
 # --- ИИ помощник ---
-genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_API_KEY"))
-model = genai.GenerativeModel('gemini-pro')
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-pro')
+else:
+    model = None
 
 def get_user_context():
     db = SessionLocal()
     habits = db.query(Habit).all()
-    habit_logs = db.query(HabitLog).filter(HabitLog.date >= datetime.utcnow() - timedelta(days=7)).all()
     transactions = db.query(Transaction).filter(Transaction.date >= datetime.utcnow() - timedelta(days=30)).all()
     books = db.query(Book).all()
     diary = db.query(DiaryEntry).order_by(DiaryEntry.date.desc()).limit(5).all()
     db.close()
     
-    context = f"""
+    return f"""
     Habits: {[h.name for h in habits]}
-    Last 7 days completions: {len([l for l in habit_logs if l.completed])} checkins
-    Finances: last 30 days - {sum(t.amount for t in transactions if t.type=='expense')} expenses, {sum(t.amount for t in transactions if t.type=='income')} income
-    Books: {len([b for b in books if b.status=='reading'])} reading, {len([b for b in books if b.status=='completed'])} completed
-    Latest diary moods: {[e.mood for e in diary]}
+    Finances (last 30d): Expenses={sum(t.amount for t in transactions if t.type=='expense')}, Income={sum(t.amount for t in transactions if t.type=='income')}
+    Books: Reading={len([b for b in books if b.status=='reading'])}, Completed={len([b for b in books if b.status=='completed'])}
+    Recent moods: {[e.mood for e in diary]}
     """
-    return context
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
+    if not model:
+        return {"response": "⚠️ Gemini API ключ не настроен. Добавь переменную GEMINI_API_KEY в Render."}
+    
     context = get_user_context()
-    prompt = f"You are LifeTrack AI assistant. User data: {context}\nUser: {request.message}\nAI:"
-    response = model.generate_content(prompt)
-    return {"response": response.text}
+    prompt = f"You are LifeTrack AI. User data: {context}\nUser: {request.message}\nAI:"
+    try:
+        response = model.generate_content(prompt)
+        return {"response": response.text}
+    except Exception as e:
+        return {"response": f"Ошибка ИИ: {str(e)}"}
 
-# --- API Эндпоинты ---
+# --- API эндпоинты ---
 @app.get("/api/habits")
 def get_habits():
     db = SessionLocal()
     habits = db.query(Habit).all()
     db.close()
-    return habits
+    return [{"id": h.id, "name": h.name, "color": h.color} for h in habits]
 
 @app.post("/api/habits")
 def create_habit(habit: HabitCreate):
@@ -138,13 +149,16 @@ def create_habit(habit: HabitCreate):
     db.commit()
     db.refresh(db_habit)
     db.close()
-    return db_habit
+    return {"id": db_habit.id, "name": db_habit.name, "color": db_habit.color}
 
 @app.post("/api/habit-logs")
 def log_habit(log: HabitLogCreate):
     db = SessionLocal()
     date_obj = datetime.fromisoformat(log.date)
-    existing = db.query(HabitLog).filter(HabitLog.habit_id == log.habit_id, HabitLog.date == date_obj).first()
+    existing = db.query(HabitLog).filter(
+        HabitLog.habit_id == log.habit_id, 
+        HabitLog.date == date_obj
+    ).first()
     if existing:
         existing.completed = log.completed
     else:
@@ -167,12 +181,20 @@ def get_streak(habit_id: int):
     db.close()
     return {"streak": streak}
 
+@app.get("/api/habit-logs")
+def get_habit_logs(habit_id: int, date: str):
+    db = SessionLocal()
+    date_obj = datetime.fromisoformat(date)
+    log = db.query(HabitLog).filter(HabitLog.habit_id == habit_id, HabitLog.date == date_obj).first()
+    db.close()
+    return {"completed": log.completed if log else False}
+
 @app.get("/api/finances")
 def get_finances():
     db = SessionLocal()
     transactions = db.query(Transaction).all()
     db.close()
-    return transactions
+    return [{"id": t.id, "amount": t.amount, "category": t.category, "type": t.type, "date": t.date.isoformat()} for t in transactions]
 
 @app.post("/api/finances")
 def add_transaction(trans: TransactionCreate):
@@ -182,24 +204,24 @@ def add_transaction(trans: TransactionCreate):
     db.commit()
     db.refresh(db_trans)
     db.close()
-    return db_trans
+    return {"id": db_trans.id}
 
 @app.get("/api/books")
 def get_books():
     db = SessionLocal()
     books = db.query(Book).all()
     db.close()
-    return books
+    return [{"id": b.id, "title": b.title, "author": b.author, "total_pages": b.total_pages, "current_page": b.current_page, "status": b.status} for b in books]
 
 @app.post("/api/books")
 def add_book(book: BookCreate):
     db = SessionLocal()
-    db_book = Book(**book.dict(), status="reading")
+    db_book = Book(**book.dict())
     db.add(db_book)
     db.commit()
     db.refresh(db_book)
     db.close()
-    return db_book
+    return {"id": db_book.id}
 
 @app.put("/api/books/{book_id}/progress")
 def update_progress(book_id: int, progress: BookProgress):
@@ -219,140 +241,160 @@ def get_diary():
     db = SessionLocal()
     entries = db.query(DiaryEntry).order_by(DiaryEntry.date.desc()).all()
     db.close()
-    return entries
+    return [{"id": e.id, "content": e.content, "mood": e.mood, "tags": json.loads(e.tags), "date": e.date.isoformat()} for e in entries]
 
 @app.post("/api/diary")
 def add_diary(entry: DiaryCreate):
     db = SessionLocal()
-    db_entry = DiaryEntry(content=entry.content, mood=entry.mood, tags=json.dumps(entry.tags))
+    db_entry = DiaryEntry(
+        content=entry.content, 
+        mood=entry.mood, 
+        tags=json.dumps(entry.tags)
+    )
     db.add(db_entry)
     db.commit()
     db.refresh(db_entry)
     db.close()
-    return db_entry
+    return {"id": db_entry.id}
 
-# --- Фронтенд (всё в одном HTML) ---
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    return """
+# --- Фронтенд ---
+HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LifeTrack — Твой трекер жизни с ИИ</title>
+    <title>LifeTrack — Трекер жизни с ИИ</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         .habit-card { transition: all 0.2s; }
         .habit-card:hover { transform: translateY(-2px); }
+        .tab-active { border-bottom-width: 2px; color: #2563eb; border-color: #2563eb; }
     </style>
 </head>
-<body class="bg-gray-50">
-    <div class="max-w-7xl mx-auto px-4 py-8">
-        <h1 class="text-4xl font-bold text-gray-800 mb-2">🧬 LifeTrack</h1>
-        <p class="text-gray-600 mb-8">Привычки · Финансы · Книги · Дневник + ИИ помощник</p>
-        
-        <!-- Tabs -->
-        <div class="flex gap-2 border-b mb-6">
-            <button onclick="showTab('habits')" class="tab-btn px-4 py-2 font-semibold text-blue-600 border-b-2 border-blue-600">📊 Привычки</button>
-            <button onclick="showTab('finances')" class="tab-btn px-4 py-2 font-semibold text-gray-600">💰 Финансы</button>
-            <button onclick="showTab('books')" class="tab-btn px-4 py-2 font-semibold text-gray-600">📚 Книги</button>
-            <button onclick="showTab('diary')" class="tab-btn px-4 py-2 font-semibold text-gray-600">📔 Дневник</button>
-            <button onclick="showTab('chat')" class="tab-btn px-4 py-2 font-semibold text-gray-600">🤖 ИИ Чат</button>
+<body class="bg-gradient-to-br from-gray-50 to-gray-100 min-h-screen">
+    <div class="max-w-6xl mx-auto px-4 py-8">
+        <div class="text-center mb-8">
+            <h1 class="text-5xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">🧬 LifeTrack</h1>
+            <p class="text-gray-600 mt-2">Привычки · Финансы · Книги · Дневник + ИИ помощник</p>
         </div>
         
-        <!-- Habits Tab -->
+        <!-- Tabs -->
+        <div class="flex flex-wrap gap-1 border-b mb-6 bg-white rounded-t-lg px-2">
+            <button onclick="showTab('habits')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="habits">📊 Привычки</button>
+            <button onclick="showTab('finances')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="finances">💰 Финансы</button>
+            <button onclick="showTab('books')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="books">📚 Книги</button>
+            <button onclick="showTab('diary')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="diary">📔 Дневник</button>
+            <button onclick="showTab('chat')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="chat">🤖 ИИ Чат</button>
+        </div>
+        
+        <!-- Habits -->
         <div id="habits" class="tab-content">
-            <div class="mb-4 flex gap-2">
-                <input type="text" id="habitName" placeholder="Новая привычка" class="border rounded px-3 py-2 flex-1">
-                <button onclick="addHabit()" class="bg-blue-500 text-white px-4 py-2 rounded">➕ Добавить</button>
+            <div class="bg-white rounded-xl shadow-md p-5 mb-5">
+                <div class="flex gap-3">
+                    <input type="text" id="habitName" placeholder="Новая привычка (например: Медитация)" class="border rounded-lg px-4 py-2 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                    <button onclick="addHabit()" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded-lg transition">➕ Добавить</button>
+                </div>
             </div>
             <div id="habitsList" class="grid md:grid-cols-2 gap-4"></div>
         </div>
         
-        <!-- Finances Tab -->
+        <!-- Finances -->
         <div id="finances" class="tab-content hidden">
             <div class="grid md:grid-cols-2 gap-6">
-                <div>
-                    <h3 class="font-bold mb-2">➕ Добавить транзакцию</h3>
-                    <input type="number" id="amount" placeholder="Сумма" class="border rounded p-2 w-full mb-2">
-                    <input type="text" id="category" placeholder="Категория" class="border rounded p-2 w-full mb-2">
-                    <select id="type" class="border rounded p-2 w-full mb-2">
-                        <option value="expense">Расход</option>
-                        <option value="income">Доход</option>
+                <div class="bg-white rounded-xl shadow-md p-5">
+                    <h3 class="font-bold text-lg mb-3">➕ Новая транзакция</h3>
+                    <input type="number" id="amount" placeholder="Сумма" class="border rounded-lg p-2 w-full mb-2">
+                    <input type="text" id="category" placeholder="Категория (еда, транспорт...)" class="border rounded-lg p-2 w-full mb-2">
+                    <select id="type" class="border rounded-lg p-2 w-full mb-3">
+                        <option value="expense">💰 Расход</option>
+                        <option value="income">💵 Доход</option>
                     </select>
-                    <button onclick="addTransaction()" class="bg-green-500 text-white px-4 py-2 rounded">Добавить</button>
+                    <button onclick="addTransaction()" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg w-full transition">Добавить</button>
                 </div>
-                <div>
-                    <canvas id="financeChart" width="400" height="300"></canvas>
+                <div class="bg-white rounded-xl shadow-md p-5">
+                    <canvas id="financeChart" height="250"></canvas>
                 </div>
             </div>
-            <div id="transactionsList" class="mt-4"></div>
+            <div id="transactionsList" class="bg-white rounded-xl shadow-md p-5 mt-5"></div>
         </div>
         
-        <!-- Books Tab -->
+        <!-- Books -->
         <div id="books" class="tab-content hidden">
-            <div class="mb-4 grid md:grid-cols-4 gap-2">
-                <input type="text" id="bookTitle" placeholder="Название" class="border rounded p-2">
-                <input type="text" id="bookAuthor" placeholder="Автор" class="border rounded p-2">
-                <input type="number" id="bookPages" placeholder="Страниц" class="border rounded p-2">
-                <button onclick="addBook()" class="bg-purple-500 text-white px-4 py-2 rounded">➕ Добавить</button>
+            <div class="bg-white rounded-xl shadow-md p-5 mb-5">
+                <div class="grid md:grid-cols-4 gap-3">
+                    <input type="text" id="bookTitle" placeholder="Название" class="border rounded-lg p-2">
+                    <input type="text" id="bookAuthor" placeholder="Автор" class="border rounded-lg p-2">
+                    <input type="number" id="bookPages" placeholder="Страниц" class="border rounded-lg p-2">
+                    <button onclick="addBook()" class="bg-purple-500 hover:bg-purple-600 text-white px-4 py-2 rounded-lg transition">➕ Добавить книгу</button>
+                </div>
             </div>
             <div id="booksList" class="grid md:grid-cols-3 gap-4"></div>
         </div>
         
-        <!-- Diary Tab -->
+        <!-- Diary -->
         <div id="diary" class="tab-content hidden">
-            <div class="bg-white rounded-lg shadow p-4 mb-4">
-                <textarea id="diaryContent" rows="3" placeholder="Что произошло сегодня?" class="border rounded p-2 w-full"></textarea>
-                <div class="flex gap-2 mt-2">
-                    <select id="diaryMood" class="border rounded p-2">
+            <div class="bg-white rounded-xl shadow-md p-5 mb-5">
+                <textarea id="diaryContent" rows="3" placeholder="Что произошло сегодня? Чем ты занимался?" class="border rounded-lg p-3 w-full"></textarea>
+                <div class="flex gap-3 mt-3">
+                    <select id="diaryMood" class="border rounded-lg p-2">
                         <option value="great">😍 Отлично</option>
                         <option value="good">😊 Хорошо</option>
                         <option value="neutral">😐 Нормально</option>
                         <option value="sad">😔 Грустно</option>
                         <option value="bad">😫 Плохо</option>
                     </select>
-                    <input type="text" id="diaryTags" placeholder="Теги через запятую (работа, спорт...)" class="border rounded p-2 flex-1">
-                    <button onclick="addDiaryEntry()" class="bg-indigo-500 text-white px-4 py-2 rounded">Сохранить</button>
+                    <input type="text" id="diaryTags" placeholder="Теги (работа, спорт, семья...)" class="border rounded-lg p-2 flex-1">
+                    <button onclick="addDiaryEntry()" class="bg-indigo-500 hover:bg-indigo-600 text-white px-6 py-2 rounded-lg transition">Сохранить</button>
                 </div>
             </div>
             <div id="diaryEntries"></div>
         </div>
         
-        <!-- AI Chat Tab -->
+        <!-- AI Chat -->
         <div id="chat" class="tab-content hidden">
-            <div class="bg-white rounded-lg shadow h-96 overflow-y-auto p-4 mb-4" id="chatMessages">
-                <div class="text-gray-500">👋 Привет! Я знаю твои привычки, финансы, книги и дневник. Спроси меня что-нибудь!</div>
+            <div class="bg-white rounded-xl shadow-md h-96 overflow-y-auto p-4 mb-4" id="chatMessages">
+                <div class="text-gray-500 text-center">👋 Привет! Я знаю твои привычки, финансы, книги и дневник. Задай мне вопрос!</div>
             </div>
-            <div class="flex gap-2">
-                <input type="text" id="chatInput" placeholder="Спроси у ИИ..." class="border rounded p-2 flex-1">
-                <button onclick="sendChat()" class="bg-blue-500 text-white px-6 py-2 rounded">Отправить</button>
+            <div class="flex gap-3">
+                <input type="text" id="chatInput" placeholder="Напиши сообщение..." class="border rounded-lg p-3 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                <button onclick="sendChat()" class="bg-blue-500 hover:bg-blue-600 text-white px-8 py-3 rounded-lg transition">Отправить</button>
             </div>
         </div>
     </div>
     
     <script>
         let financeChart = null;
+        let currentTab = 'habits';
         
         async function apiCall(url, method='GET', data=null) {
             const options = { method, headers: {'Content-Type': 'application/json'} };
             if (data) options.body = JSON.stringify(data);
             const res = await fetch(url, options);
+            if (!res.ok) throw new Error(await res.text());
             return res.json();
         }
         
         function showTab(tab) {
+            currentTab = tab;
             document.querySelectorAll('.tab-content').forEach(t => t.classList.add('hidden'));
             document.getElementById(tab).classList.remove('hidden');
-            if (tab === 'finances') loadFinances();
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('tab-active', 'text-blue-600', 'border-blue-600');
+                btn.classList.add('text-gray-600');
+            });
+            const activeBtn = document.querySelector(`[data-tab="${tab}"]`) || document.querySelector(`button[onclick="showTab('${tab}')"]`);
+            if (activeBtn) {
+                activeBtn.classList.add('tab-active', 'text-blue-600', 'border-blue-600');
+                activeBtn.classList.remove('text-gray-600');
+            }
             if (tab === 'habits') loadHabits();
+            if (tab === 'finances') loadFinances();
             if (tab === 'books') loadBooks();
             if (tab === 'diary') loadDiary();
         }
         
-        // Habits
         async function loadHabits() {
             const habits = await apiCall('/api/habits');
             const container = document.getElementById('habitsList');
@@ -360,17 +402,16 @@ def read_root():
             for (const habit of habits) {
                 const streak = await apiCall(`/api/habit-streak/${habit.id}`);
                 const today = new Date().toISOString().split('T')[0];
-                const log = await apiCall(`/api/habit-logs?habit_id=${habit.id}&date=${today}`).catch(() => null);
-                const completed = log?.completed || false;
+                const log = await apiCall(`/api/habit-logs?habit_id=${habit.id}&date=${today}`);
                 container.innerHTML += `
-                    <div class="habit-card bg-white rounded-lg shadow p-4 border-l-8" style="border-left-color: ${habit.color}">
+                    <div class="habit-card bg-white rounded-xl shadow-md p-4 border-l-8" style="border-left-color: ${habit.color}">
                         <div class="flex justify-between items-center">
                             <div>
-                                <h3 class="font-bold text-lg">${habit.name}</h3>
-                                <p class="text-sm text-gray-500">🔥 Серия: ${streak.streak} дней</p>
+                                <h3 class="font-bold text-lg">${escapeHtml(habit.name)}</h3>
+                                <p class="text-sm text-gray-500">🔥 Серия: ${streak.streak} ${declension(streak.streak, 'день', 'дня', 'дней')}</p>
                             </div>
-                            <button onclick="toggleHabit(${habit.id}, ${!completed})" class="px-4 py-2 rounded ${completed ? 'bg-green-500' : 'bg-gray-300'} text-white">
-                                ${completed ? '✅ Выполнено' : '⭕ Отметить'}
+                            <button onclick="toggleHabit(${habit.id}, ${!log.completed})" class="px-4 py-2 rounded-lg transition ${log.completed ? 'bg-green-500 hover:bg-green-600' : 'bg-gray-400 hover:bg-gray-500'} text-white">
+                                ${log.completed ? '✅ Выполнено' : '⭕ Отметить'}
                             </button>
                         </div>
                     </div>
@@ -378,20 +419,32 @@ def read_root():
             }
         }
         
+        function declension(n, one, two, five) {
+            n = Math.abs(n) % 100;
+            if (n >= 5 && n <= 20) return five;
+            n %= 10;
+            if (n === 1) return one;
+            if (n >= 2 && n <= 4) return two;
+            return five;
+        }
+        
         async function addHabit() {
-            const name = document.getElementById('habitName').value;
-            if (!name) return;
+            const name = document.getElementById('habitName').value.trim();
+            if (!name) return alert('Введите название привычки');
             await apiCall('/api/habits', 'POST', { name });
             loadHabits();
             document.getElementById('habitName').value = '';
         }
         
         async function toggleHabit(habitId, completed) {
-            await apiCall('/api/habit-logs', 'POST', { habit_id: habitId, date: new Date().toISOString().split('T')[0], completed });
+            await apiCall('/api/habit-logs', 'POST', { 
+                habit_id: habitId, 
+                date: new Date().toISOString().split('T')[0], 
+                completed 
+            });
             loadHabits();
         }
         
-        // Finances
         async function loadFinances() {
             const transactions = await apiCall('/api/finances');
             const expenses = transactions.filter(t => t.type === 'expense').reduce((sum, t) => sum + t.amount, 0);
@@ -400,49 +453,64 @@ def read_root():
             const ctx = document.getElementById('financeChart').getContext('2d');
             financeChart = new Chart(ctx, {
                 type: 'doughnut',
-                data: { labels: ['Расходы', 'Доходы'], datasets: [{ data: [expenses, income], backgroundColor: ['#EF4444', '#10B981'] }] }
+                data: { labels: ['Расходы', 'Доходы'], datasets: [{ data: [expenses, income], backgroundColor: ['#ef4444', '#10b981'] }] },
+                options: { responsive: true, maintainAspectRatio: true }
             });
             const list = document.getElementById('transactionsList');
-            list.innerHTML = '<h3 class="font-bold mb-2">📜 История</h3>' + transactions.map(t => `<div class="flex justify-between border-b py-2"><span>${t.category}</span><span class="${t.type === 'expense' ? 'text-red-600' : 'text-green-600'}">${t.type === 'expense' ? '-' : '+'}${t.amount} ₽</span><span class="text-sm text-gray-500">${new Date(t.date).toLocaleDateString()}</span></div>`).join('');
+            list.innerHTML = '<h3 class="font-bold mb-3">📜 История операций</h3>' + 
+                (transactions.length === 0 ? '<p class="text-gray-500">Пока нет транзакций</p>' :
+                transactions.map(t => `<div class="flex justify-between border-b py-2"><span>${escapeHtml(t.category)}</span><span class="${t.type === 'expense' ? 'text-red-600' : 'text-green-600'} font-semibold">${t.type === 'expense' ? '-' : '+'}${t.amount} ₽</span><span class="text-sm text-gray-500">${new Date(t.date).toLocaleDateString()}</span></div>`).join(''));
         }
         
         async function addTransaction() {
             const amount = parseFloat(document.getElementById('amount').value);
-            const category = document.getElementById('category').value;
+            const category = document.getElementById('category').value.trim();
             const type = document.getElementById('type').value;
-            if (!amount || !category) return;
+            if (!amount || !category) return alert('Заполните сумму и категорию');
             await apiCall('/api/finances', 'POST', { amount, category, type });
             loadFinances();
             document.getElementById('amount').value = '';
             document.getElementById('category').value = '';
         }
         
-        // Books
         async function loadBooks() {
             const books = await apiCall('/api/books');
             const container = document.getElementById('booksList');
-            container.innerHTML = books.map(book => `
-                <div class="bg-white rounded-lg shadow p-4">
-                    <h3 class="font-bold">${book.title}</h3>
-                    <p class="text-sm text-gray-600">${book.author}</p>
-                    <div class="mt-2">
-                        <div class="bg-gray-200 rounded-full h-2">
-                            <div class="bg-purple-600 rounded-full h-2" style="width: ${(book.current_page/book.total_pages)*100}%"></div>
+            if (books.length === 0) {
+                container.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8">📖 Добавь свою первую книгу</div>';
+                return;
+            }
+            container.innerHTML = books.map(book => {
+                const percent = (book.current_page / book.total_pages) * 100;
+                return `
+                    <div class="bg-white rounded-xl shadow-md p-4">
+                        <h3 class="font-bold text-lg">${escapeHtml(book.title)}</h3>
+                        <p class="text-sm text-gray-600 mb-2">${escapeHtml(book.author)}</p>
+                        <div class="mt-3">
+                            <div class="bg-gray-200 rounded-full h-2 overflow-hidden">
+                                <div class="bg-purple-600 rounded-full h-2 transition-all" style="width: ${percent}%"></div>
+                            </div>
+                            <div class="flex justify-between text-sm mt-2">
+                                <span>${book.current_page} / ${book.total_pages} стр.</span>
+                                <span>${Math.round(percent)}%</span>
+                            </div>
+                            <input type="range" min="0" max="${book.total_pages}" value="${book.current_page}" onchange="updateProgress(${book.id}, this.value)" class="w-full mt-3 accent-purple-600">
                         </div>
-                        <p class="text-xs mt-1">${book.current_page} / ${book.total_pages} стр.</p>
-                        <input type="range" min="0" max="${book.total_pages}" value="${book.current_page}" onchange="updateProgress(${book.id}, this.value)" class="w-full mt-2">
                     </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
         
         async function addBook() {
-            const title = document.getElementById('bookTitle').value;
-            const author = document.getElementById('bookAuthor').value;
+            const title = document.getElementById('bookTitle').value.trim();
+            const author = document.getElementById('bookAuthor').value.trim();
             const total_pages = parseInt(document.getElementById('bookPages').value);
-            if (!title || !author || !total_pages) return;
+            if (!title || !author || !total_pages) return alert('Заполните все поля');
             await apiCall('/api/books', 'POST', { title, author, total_pages });
             loadBooks();
+            document.getElementById('bookTitle').value = '';
+            document.getElementById('bookAuthor').value = '';
+            document.getElementById('bookPages').value = '';
         }
         
         async function updateProgress(bookId, page) {
@@ -450,53 +518,79 @@ def read_root():
             loadBooks();
         }
         
-        // Diary
         async function loadDiary() {
             const entries = await apiCall('/api/diary');
             const container = document.getElementById('diaryEntries');
-            container.innerHTML = entries.map(entry => `
-                <div class="bg-white rounded-lg shadow p-4 mb-3">
-                    <div class="flex justify-between items-start">
-                        <span class="text-2xl">${entry.mood === 'great' ? '😍' : entry.mood === 'good' ? '😊' : entry.mood === 'neutral' ? '😐' : entry.mood === 'sad' ? '😔' : '😫'}</span>
-                        <span class="text-sm text-gray-500">${new Date(entry.date).toLocaleDateString()}</span>
+            if (entries.length === 0) {
+                container.innerHTML = '<div class="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">📝 Пока нет записей. Напиши что-нибудь!</div>';
+                return;
+            }
+            container.innerHTML = entries.map(entry => {
+                const moodEmoji = { great: '😍', good: '😊', neutral: '😐', sad: '😔', bad: '😫' }[entry.mood] || '😐';
+                const tags = Array.isArray(entry.tags) ? entry.tags : [];
+                return `
+                    <div class="bg-white rounded-xl shadow-md p-4 mb-3">
+                        <div class="flex justify-between items-start mb-2">
+                            <span class="text-3xl">${moodEmoji}</span>
+                            <span class="text-sm text-gray-500">${new Date(entry.date).toLocaleDateString('ru-RU')}</span>
+                        </div>
+                        <p class="text-gray-800 whitespace-pre-wrap">${escapeHtml(entry.content)}</p>
+                        ${tags.length ? `<div class="mt-3 flex flex-wrap gap-2">${tags.map(tag => `<span class="bg-gray-100 px-2 py-1 rounded-lg text-xs text-gray-600">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
                     </div>
-                    <p class="mt-2">${entry.content}</p>
-                    <div class="mt-2 flex gap-2">
-                        ${JSON.parse(entry.tags || '[]').map(tag => `<span class="bg-gray-200 px-2 py-1 rounded text-xs">#${tag}</span>`).join('')}
-                    </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
         
         async function addDiaryEntry() {
-            const content = document.getElementById('diaryContent').value;
+            const content = document.getElementById('diaryContent').value.trim();
             const mood = document.getElementById('diaryMood').value;
             const tags = document.getElementById('diaryTags').value.split(',').map(t => t.trim()).filter(t => t);
-            if (!content) return;
+            if (!content) return alert('Напишите что-нибудь');
             await apiCall('/api/diary', 'POST', { content, mood, tags });
             loadDiary();
             document.getElementById('diaryContent').value = '';
             document.getElementById('diaryTags').value = '';
         }
         
-        // AI Chat
         async function sendChat() {
             const input = document.getElementById('chatInput');
-            const message = input.value;
+            const message = input.value.trim();
             if (!message) return;
             const messagesDiv = document.getElementById('chatMessages');
-            messagesDiv.innerHTML += `<div class="text-right mb-2"><span class="bg-blue-100 inline-block p-2 rounded-lg">${message}</span></div>`;
+            messagesDiv.innerHTML += `<div class="text-right mb-3"><span class="bg-blue-500 text-white inline-block p-3 rounded-2xl rounded-tr-sm max-w-[80%]">${escapeHtml(message)}</span></div>`;
             input.value = '';
-            const response = await apiCall('/api/chat', 'POST', { message });
-            messagesDiv.innerHTML += `<div class="text-left mb-2"><span class="bg-gray-100 inline-block p-2 rounded-lg">🤖 ${response.response}</span></div>`;
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            try {
+                const response = await apiCall('/api/chat', 'POST', { message });
+                messagesDiv.innerHTML += `<div class="text-left mb-3"><span class="bg-gray-100 text-gray-800 inline-block p-3 rounded-2xl rounded-tl-sm max-w-[80%]">🤖 ${escapeHtml(response.response)}</span></div>`;
+            } catch (e) {
+                messagesDiv.innerHTML += `<div class="text-left mb-3"><span class="bg-red-100 text-red-600 inline-block p-3 rounded-2xl">⚠️ Ошибка: ${escapeHtml(e.message)}</span></div>`;
+            }
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
         
-        loadHabits();
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            }).replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, function(c) {
+                return c;
+            });
+        }
+        
+        // Инициализация
+        showTab('habits');
     </script>
 </body>
 </html>
-    """
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    return HTML_TEMPLATE
 
 if __name__ == "__main__":
     import uvicorn
