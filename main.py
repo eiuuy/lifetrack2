@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -13,7 +14,6 @@ import google.generativeai as genai
 # --- Конфиг ---
 app = FastAPI()
 
-# База данных с проверкой на Render
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lifetrack.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -257,14 +257,13 @@ def add_diary(entry: DiaryCreate):
     db.close()
     return {"id": db_entry.id}
 
-# --- Фронтенд ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+# --- Фронтенд с экранированными символами ---
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LifeTrack — Трекер жизни с ИИ</title>
+    <title>LifeTrack - Track your life with AI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
@@ -276,42 +275,39 @@ HTML_TEMPLATE = """
 <body class="bg-gradient-to-br from-gray-50 to-gray-100 min-h-screen">
     <div class="max-w-6xl mx-auto px-4 py-8">
         <div class="text-center mb-8">
-            <h1 class="text-5xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">🧬 LifeTrack</h1>
-            <p class="text-gray-600 mt-2">Привычки · Финансы · Книги · Дневник + ИИ помощник</p>
+            <h1 class="text-5xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">LifeTrack</h1>
+            <p class="text-gray-600 mt-2">Habits · Finance · Books · Journal + AI Assistant</p>
         </div>
         
-        <!-- Tabs -->
         <div class="flex flex-wrap gap-1 border-b mb-6 bg-white rounded-t-lg px-2">
-            <button onclick="showTab('habits')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="habits">📊 Привычки</button>
-            <button onclick="showTab('finances')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="finances">💰 Финансы</button>
-            <button onclick="showTab('books')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="books">📚 Книги</button>
-            <button onclick="showTab('diary')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="diary">📔 Дневник</button>
-            <button onclick="showTab('chat')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="chat">🤖 ИИ Чат</button>
+            <button onclick="showTab('habits')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="habits">Habits</button>
+            <button onclick="showTab('finances')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="finances">Finance</button>
+            <button onclick="showTab('books')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="books">Books</button>
+            <button onclick="showTab('diary')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="diary">Journal</button>
+            <button onclick="showTab('chat')" class="tab-btn px-5 py-3 font-semibold text-gray-600 hover:text-blue-600 transition" data-tab="chat">AI Chat</button>
         </div>
         
-        <!-- Habits -->
         <div id="habits" class="tab-content">
             <div class="bg-white rounded-xl shadow-md p-5 mb-5">
                 <div class="flex gap-3">
-                    <input type="text" id="habitName" placeholder="Новая привычка (например: Медитация)" class="border rounded-lg px-4 py-2 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
-                    <button onclick="addHabit()" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded-lg transition">➕ Добавить</button>
+                    <input type="text" id="habitName" placeholder="New habit (e.g., Meditation)" class="border rounded-lg px-4 py-2 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                    <button onclick="addHabit()" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-2 rounded-lg transition">+ Add</button>
                 </div>
             </div>
             <div id="habitsList" class="grid md:grid-cols-2 gap-4"></div>
         </div>
         
-        <!-- Finances -->
         <div id="finances" class="tab-content hidden">
             <div class="grid md:grid-cols-2 gap-6">
                 <div class="bg-white rounded-xl shadow-md p-5">
-                    <h3 class="font-bold text-lg mb-3">➕ Новая транзакция</h3>
-                    <input type="number" id="amount" placeholder="Сумма" class="border rounded-lg p-2 w-full mb-2">
-                    <input type="text" id="category" placeholder="Категория (еда, транспорт...)" class="border rounded-lg p-2 w-full mb-2">
+                    <h3 class="font-bold text-lg mb-3">+ New Transaction</h3>
+                    <input type="number" id="amount" placeholder="Amount" class="border rounded-lg p-2 w-full mb-2">
+                    <input type="text" id="category" placeholder="Category (food, transport...)" class="border rounded-lg p-2 w-full mb-2">
                     <select id="type" class="border rounded-lg p-2 w-full mb-3">
-                        <option value="expense">💰 Расход</option>
-                        <option value="income">💵 Доход</option>
+                        <option value="expense">Expense</option>
+                        <option value="income">Income</option>
                     </select>
-                    <button onclick="addTransaction()" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg w-full transition">Добавить</button>
+                    <button onclick="addTransaction()" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg w-full transition">Add</button>
                 </div>
                 <div class="bg-white rounded-xl shadow-md p-5">
                     <canvas id="financeChart" height="250"></canvas>
@@ -320,53 +316,49 @@ HTML_TEMPLATE = """
             <div id="transactionsList" class="bg-white rounded-xl shadow-md p-5 mt-5"></div>
         </div>
         
-        <!-- Books -->
         <div id="books" class="tab-content hidden">
             <div class="bg-white rounded-xl shadow-md p-5 mb-5">
                 <div class="grid md:grid-cols-4 gap-3">
-                    <input type="text" id="bookTitle" placeholder="Название" class="border rounded-lg p-2">
-                    <input type="text" id="bookAuthor" placeholder="Автор" class="border rounded-lg p-2">
-                    <input type="number" id="bookPages" placeholder="Страниц" class="border rounded-lg p-2">
-                    <button onclick="addBook()" class="bg-purple-500 hover:bg-purple-600 text-white px-4 py-2 rounded-lg transition">➕ Добавить книгу</button>
+                    <input type="text" id="bookTitle" placeholder="Title" class="border rounded-lg p-2">
+                    <input type="text" id="bookAuthor" placeholder="Author" class="border rounded-lg p-2">
+                    <input type="number" id="bookPages" placeholder="Pages" class="border rounded-lg p-2">
+                    <button onclick="addBook()" class="bg-purple-500 hover:bg-purple-600 text-white px-4 py-2 rounded-lg transition">+ Add Book</button>
                 </div>
             </div>
             <div id="booksList" class="grid md:grid-cols-3 gap-4"></div>
         </div>
         
-        <!-- Diary -->
         <div id="diary" class="tab-content hidden">
             <div class="bg-white rounded-xl shadow-md p-5 mb-5">
-                <textarea id="diaryContent" rows="3" placeholder="Что произошло сегодня? Чем ты занимался?" class="border rounded-lg p-3 w-full"></textarea>
+                <textarea id="diaryContent" rows="3" placeholder="What happened today?" class="border rounded-lg p-3 w-full"></textarea>
                 <div class="flex gap-3 mt-3">
                     <select id="diaryMood" class="border rounded-lg p-2">
-                        <option value="great">😍 Отлично</option>
-                        <option value="good">😊 Хорошо</option>
-                        <option value="neutral">😐 Нормально</option>
-                        <option value="sad">😔 Грустно</option>
-                        <option value="bad">😫 Плохо</option>
+                        <option value="great">Great</option>
+                        <option value="good">Good</option>
+                        <option value="neutral">Neutral</option>
+                        <option value="sad">Sad</option>
+                        <option value="bad">Bad</option>
                     </select>
-                    <input type="text" id="diaryTags" placeholder="Теги (работа, спорт, семья...)" class="border rounded-lg p-2 flex-1">
-                    <button onclick="addDiaryEntry()" class="bg-indigo-500 hover:bg-indigo-600 text-white px-6 py-2 rounded-lg transition">Сохранить</button>
+                    <input type="text" id="diaryTags" placeholder="Tags (work, sports...)" class="border rounded-lg p-2 flex-1">
+                    <button onclick="addDiaryEntry()" class="bg-indigo-500 hover:bg-indigo-600 text-white px-6 py-2 rounded-lg transition">Save</button>
                 </div>
             </div>
             <div id="diaryEntries"></div>
         </div>
         
-        <!-- AI Chat -->
         <div id="chat" class="tab-content hidden">
             <div class="bg-white rounded-xl shadow-md h-96 overflow-y-auto p-4 mb-4" id="chatMessages">
-                <div class="text-gray-500 text-center">👋 Привет! Я знаю твои привычки, финансы, книги и дневник. Задай мне вопрос!</div>
+                <div class="text-gray-500 text-center">Hi! I know your habits, finances, books, and journal. Ask me anything!</div>
             </div>
             <div class="flex gap-3">
-                <input type="text" id="chatInput" placeholder="Напиши сообщение..." class="border rounded-lg p-3 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
-                <button onclick="sendChat()" class="bg-blue-500 hover:bg-blue-600 text-white px-8 py-3 rounded-lg transition">Отправить</button>
+                <input type="text" id="chatInput" placeholder="Type your message..." class="border rounded-lg p-3 flex-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                <button onclick="sendChat()" class="bg-blue-500 hover:bg-blue-600 text-white px-8 py-3 rounded-lg transition">Send</button>
             </div>
         </div>
     </div>
     
     <script>
         let financeChart = null;
-        let currentTab = 'habits';
         
         async function apiCall(url, method='GET', data=null) {
             const options = { method, headers: {'Content-Type': 'application/json'} };
@@ -377,7 +369,6 @@ HTML_TEMPLATE = """
         }
         
         function showTab(tab) {
-            currentTab = tab;
             document.querySelectorAll('.tab-content').forEach(t => t.classList.add('hidden'));
             document.getElementById(tab).classList.remove('hidden');
             document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -408,10 +399,10 @@ HTML_TEMPLATE = """
                         <div class="flex justify-between items-center">
                             <div>
                                 <h3 class="font-bold text-lg">${escapeHtml(habit.name)}</h3>
-                                <p class="text-sm text-gray-500">🔥 Серия: ${streak.streak} ${declension(streak.streak, 'день', 'дня', 'дней')}</p>
+                                <p class="text-sm text-gray-500">Streak: ${streak.streak} days</p>
                             </div>
                             <button onclick="toggleHabit(${habit.id}, ${!log.completed})" class="px-4 py-2 rounded-lg transition ${log.completed ? 'bg-green-500 hover:bg-green-600' : 'bg-gray-400 hover:bg-gray-500'} text-white">
-                                ${log.completed ? '✅ Выполнено' : '⭕ Отметить'}
+                                ${log.completed ? 'Done' : 'Mark'}
                             </button>
                         </div>
                     </div>
@@ -419,18 +410,9 @@ HTML_TEMPLATE = """
             }
         }
         
-        function declension(n, one, two, five) {
-            n = Math.abs(n) % 100;
-            if (n >= 5 && n <= 20) return five;
-            n %= 10;
-            if (n === 1) return one;
-            if (n >= 2 && n <= 4) return two;
-            return five;
-        }
-        
         async function addHabit() {
             const name = document.getElementById('habitName').value.trim();
-            if (!name) return alert('Введите название привычки');
+            if (!name) return alert('Enter habit name');
             await apiCall('/api/habits', 'POST', { name });
             loadHabits();
             document.getElementById('habitName').value = '';
@@ -453,20 +435,20 @@ HTML_TEMPLATE = """
             const ctx = document.getElementById('financeChart').getContext('2d');
             financeChart = new Chart(ctx, {
                 type: 'doughnut',
-                data: { labels: ['Расходы', 'Доходы'], datasets: [{ data: [expenses, income], backgroundColor: ['#ef4444', '#10b981'] }] },
+                data: { labels: ['Expenses', 'Income'], datasets: [{ data: [expenses, income], backgroundColor: ['#ef4444', '#10b981'] }] },
                 options: { responsive: true, maintainAspectRatio: true }
             });
             const list = document.getElementById('transactionsList');
-            list.innerHTML = '<h3 class="font-bold mb-3">📜 История операций</h3>' + 
-                (transactions.length === 0 ? '<p class="text-gray-500">Пока нет транзакций</p>' :
-                transactions.map(t => `<div class="flex justify-between border-b py-2"><span>${escapeHtml(t.category)}</span><span class="${t.type === 'expense' ? 'text-red-600' : 'text-green-600'} font-semibold">${t.type === 'expense' ? '-' : '+'}${t.amount} ₽</span><span class="text-sm text-gray-500">${new Date(t.date).toLocaleDateString()}</span></div>`).join(''));
+            list.innerHTML = '<h3 class="font-bold mb-3">History</h3>' + 
+                (transactions.length === 0 ? '<p class="text-gray-500">No transactions yet</p>' :
+                transactions.map(t => `<div class="flex justify-between border-b py-2"><span>${escapeHtml(t.category)}</span><span class="${t.type === 'expense' ? 'text-red-600' : 'text-green-600'} font-semibold">${t.type === 'expense' ? '-' : '+'}${t.amount}</span><span class="text-sm text-gray-500">${new Date(t.date).toLocaleDateString()}</span></div>`).join(''));
         }
         
         async function addTransaction() {
             const amount = parseFloat(document.getElementById('amount').value);
             const category = document.getElementById('category').value.trim();
             const type = document.getElementById('type').value;
-            if (!amount || !category) return alert('Заполните сумму и категорию');
+            if (!amount || !category) return alert('Fill amount and category');
             await apiCall('/api/finances', 'POST', { amount, category, type });
             loadFinances();
             document.getElementById('amount').value = '';
@@ -477,7 +459,7 @@ HTML_TEMPLATE = """
             const books = await apiCall('/api/books');
             const container = document.getElementById('booksList');
             if (books.length === 0) {
-                container.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8">📖 Добавь свою первую книгу</div>';
+                container.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8">Add your first book</div>';
                 return;
             }
             container.innerHTML = books.map(book => {
@@ -491,7 +473,7 @@ HTML_TEMPLATE = """
                                 <div class="bg-purple-600 rounded-full h-2 transition-all" style="width: ${percent}%"></div>
                             </div>
                             <div class="flex justify-between text-sm mt-2">
-                                <span>${book.current_page} / ${book.total_pages} стр.</span>
+                                <span>${book.current_page} / ${book.total_pages} pages</span>
                                 <span>${Math.round(percent)}%</span>
                             </div>
                             <input type="range" min="0" max="${book.total_pages}" value="${book.current_page}" onchange="updateProgress(${book.id}, this.value)" class="w-full mt-3 accent-purple-600">
@@ -505,7 +487,7 @@ HTML_TEMPLATE = """
             const title = document.getElementById('bookTitle').value.trim();
             const author = document.getElementById('bookAuthor').value.trim();
             const total_pages = parseInt(document.getElementById('bookPages').value);
-            if (!title || !author || !total_pages) return alert('Заполните все поля');
+            if (!title || !author || !total_pages) return alert('Fill all fields');
             await apiCall('/api/books', 'POST', { title, author, total_pages });
             loadBooks();
             document.getElementById('bookTitle').value = '';
@@ -522,17 +504,17 @@ HTML_TEMPLATE = """
             const entries = await apiCall('/api/diary');
             const container = document.getElementById('diaryEntries');
             if (entries.length === 0) {
-                container.innerHTML = '<div class="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">📝 Пока нет записей. Напиши что-нибудь!</div>';
+                container.innerHTML = '<div class="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">No entries yet. Write something!</div>';
                 return;
             }
             container.innerHTML = entries.map(entry => {
-                const moodEmoji = { great: '😍', good: '😊', neutral: '😐', sad: '😔', bad: '😫' }[entry.mood] || '😐';
+                const moodText = { great: 'Great', good: 'Good', neutral: 'Neutral', sad: 'Sad', bad: 'Bad' }[entry.mood] || 'Neutral';
                 const tags = Array.isArray(entry.tags) ? entry.tags : [];
                 return `
                     <div class="bg-white rounded-xl shadow-md p-4 mb-3">
                         <div class="flex justify-between items-start mb-2">
-                            <span class="text-3xl">${moodEmoji}</span>
-                            <span class="text-sm text-gray-500">${new Date(entry.date).toLocaleDateString('ru-RU')}</span>
+                            <span class="font-semibold text-gray-700">${moodText}</span>
+                            <span class="text-sm text-gray-500">${new Date(entry.date).toLocaleDateString()}</span>
                         </div>
                         <p class="text-gray-800 whitespace-pre-wrap">${escapeHtml(entry.content)}</p>
                         ${tags.length ? `<div class="mt-3 flex flex-wrap gap-2">${tags.map(tag => `<span class="bg-gray-100 px-2 py-1 rounded-lg text-xs text-gray-600">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
@@ -545,7 +527,7 @@ HTML_TEMPLATE = """
             const content = document.getElementById('diaryContent').value.trim();
             const mood = document.getElementById('diaryMood').value;
             const tags = document.getElementById('diaryTags').value.split(',').map(t => t.trim()).filter(t => t);
-            if (!content) return alert('Напишите что-нибудь');
+            if (!content) return alert('Write something');
             await apiCall('/api/diary', 'POST', { content, mood, tags });
             loadDiary();
             document.getElementById('diaryContent').value = '';
@@ -557,14 +539,14 @@ HTML_TEMPLATE = """
             const message = input.value.trim();
             if (!message) return;
             const messagesDiv = document.getElementById('chatMessages');
-            messagesDiv.innerHTML += `<div class="text-right mb-3"><span class="bg-blue-500 text-white inline-block p-3 rounded-2xl rounded-tr-sm max-w-[80%]">${escapeHtml(message)}</span></div>`;
+            messagesDiv.innerHTML += '<div class="text-right mb-3"><span class="bg-blue-500 text-white inline-block p-3 rounded-2xl rounded-tr-sm max-w-[80%]">' + escapeHtml(message) + '</span></div>';
             input.value = '';
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             try {
                 const response = await apiCall('/api/chat', 'POST', { message });
-                messagesDiv.innerHTML += `<div class="text-left mb-3"><span class="bg-gray-100 text-gray-800 inline-block p-3 rounded-2xl rounded-tl-sm max-w-[80%]">🤖 ${escapeHtml(response.response)}</span></div>`;
+                messagesDiv.innerHTML += '<div class="text-left mb-3"><span class="bg-gray-100 text-gray-800 inline-block p-3 rounded-2xl rounded-tl-sm max-w-[80%]">' + escapeHtml(response.response) + '</span></div>';
             } catch (e) {
-                messagesDiv.innerHTML += `<div class="text-left mb-3"><span class="bg-red-100 text-red-600 inline-block p-3 rounded-2xl">⚠️ Ошибка: ${escapeHtml(e.message)}</span></div>`;
+                messagesDiv.innerHTML += '<div class="text-left mb-3"><span class="bg-red-100 text-red-600 inline-block p-3 rounded-2xl">Error: ' + escapeHtml(e.message) + '</span></div>';
             }
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
@@ -576,17 +558,13 @@ HTML_TEMPLATE = """
                 if (m === '<') return '&lt;';
                 if (m === '>') return '&gt;';
                 return m;
-            }).replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, function(c) {
-                return c;
             });
         }
         
-        // Инициализация
         showTab('habits');
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
